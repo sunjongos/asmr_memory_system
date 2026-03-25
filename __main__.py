@@ -3,15 +3,18 @@ import json
 import argparse
 import sys
 import logging
+import httpx
+import os
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from .core import ASMRParallelOrchestrator
 from .dr_claw_search import DrClawSearchOrchestrator
 from .luca_observer import LucaMemoryObserver
-
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-import httpx
-import os
 
 async def gemini_llm_call(system_prompt: str, user_prompt: str, json_schema: dict) -> str:
     """GEMINI_API_KEY 환경변수를 사용하여 실제 Gemini 2.5 Flash API를 호출합니다."""
