@@ -5,37 +5,37 @@ from typing import List, Dict, Any, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
+EMPTY_CONTEXT_THRESHOLD = 20  # Minimum chars to consider context valid
+
+
 class ASMRAgent:
-    """ASMR 단일 역할 에이전트의 정의입니다."""
+    """Single-role ASMR agent definition."""
+
     def __init__(self, name: str, system_prompt: str, json_schema: Dict[str, Any] = None):
         self.name = name
         self.system_prompt = system_prompt
         self.json_schema = json_schema
 
+
 class ASMRParallelOrchestrator:
     """
-    ASMR의 근간인 병렬 에이전트 연산을 통제하는 오케스트레이터입니다.
-    여러 Agent 객체를 한 번에 비동기(async)로 실행하고, 결과를 Merge합니다.
+    Core parallel orchestrator that runs multiple ASMR agents concurrently
+    via asyncio.gather(), then optionally cross-validates results with an
+    Arbiter agent.
     """
-    
+
     def __init__(self, llm_async_callable: Callable[[str, str, Dict], Awaitable[str]]):
-        """
-        :param llm_async_callable: 실제 LLM API를 호출할 비동기 함수. 
-               서명: async def call_llm(system_prompt: str, user_prompt: str, schema: dict) -> str
-        """
         self.llm_async_callable = llm_async_callable
 
     async def _run_agent(self, agent: ASMRAgent, context_data: str) -> Dict[str, Any]:
-        """개별 에이전트에 데이터를 먹이고 결과를 받아오는 래퍼 함수"""
+        """Run a single agent and return structured result."""
         try:
-            # LLM 호출
             response_text = await self.llm_async_callable(
                 agent.system_prompt,
                 context_data,
-                agent.json_schema
+                agent.json_schema,
             )
-            
-            # JSON 파싱 시도 (LLM이 JSON 텍스트를 반환한다고 가정)
+
             try:
                 result_data = json.loads(response_text)
             except json.JSONDecodeError:
@@ -44,52 +44,115 @@ class ASMRParallelOrchestrator:
             return {
                 "agent_name": agent.name,
                 "status": "success",
-                "data": result_data
+                "data": result_data,
             }
         except Exception as e:
-            logger.error(f"Agent {agent.name} failed: {str(e)}")
+            logger.error(f"Agent {agent.name} failed: {e}")
             return {
                 "agent_name": agent.name,
                 "status": "error",
-                "error": str(e)
+                "error": str(e),
             }
 
-    async def run_parallel_analysis(self, agents: List[ASMRAgent], context_data: str) -> Dict[str, Any]:
+    async def run_parallel_analysis(
+        self,
+        agents: List[ASMRAgent],
+        context_data: str,
+        run_arbiter: bool = True,
+    ) -> Dict[str, Any]:
         """
-        주어진 세션/문서 데이터를 여러 에이전트가 동시에 읽고 팩트를 추출합니다.
-        :param agents: 분석을 수행할 ASMR 에이전트 목록 (예: FactAgent, TimelineAgent 등)
-        :param context_data: 대상 텍스트 (로그, 의료기록 등)
-        :return: 병합된 분석 결과 딕셔너리
+        Run all agents in parallel on the same context data.
+        If run_arbiter=True, a 4th Arbiter agent cross-validates the results
+        for contradictions and assigns a confidence score.
         """
+        if not context_data or len(context_data.strip()) < EMPTY_CONTEXT_THRESHOLD:
+            return {
+                "orchestration_status": "aborted",
+                "reason": f"Context data too short ({len(context_data.strip())} chars). "
+                          f"Minimum {EMPTY_CONTEXT_THRESHOLD} chars required to prevent hallucination.",
+                "agent_results": {},
+            }
+
         tasks = [self._run_agent(agent, context_data) for agent in agents]
-        
-        # asyncio.gather를 사용해 완전 병렬로 LLM Request 실행
         results = await asyncio.gather(*tasks)
-        
+
+        agent_results = {}
+        successful_count = 0
+        for res in results:
+            agent_results[res["agent_name"]] = res
+            if res["status"] == "success":
+                successful_count += 1
+
         merged_report = {
             "orchestration_status": "completed",
-            "agent_results": {}
+            "agents_total": len(agents),
+            "agents_succeeded": successful_count,
+            "agent_results": agent_results,
         }
-        
-        for res in results:
-            merged_report["agent_results"][res["agent_name"]] = res
-            
+
+        # Arbiter: cross-validate if at least 2 agents succeeded
+        if run_arbiter and successful_count >= 2:
+            arbiter_result = await self._run_arbiter(agent_results)
+            merged_report["arbiter"] = arbiter_result
+
         return merged_report
 
-# 사용 예시 (더미용)
-# if __name__ == "__main__":
-#     async def mock_llm_call(sys_prompt, user_prompt, schema):
-#         await asyncio.sleep(1) # 네트워크 딜레이 시뮬레이션
-#         return '{"summary": "mocked result"}'
-#     
-#     orchestrator = ASMRParallelOrchestrator(llm_async_callable=mock_llm_call)
-#     agents = [
-#         ASMRAgent("FactSearcher", "너는 팩트만 추출한다."),
-#         ASMRAgent("TimelineTracker", "너는 시간대별로 정보를 나열한다.")
-#     ]
-#     
-#     async def test():
-#         result = await orchestrator.run_parallel_analysis(agents, "여기에 긴 히스토리 텍스트")
-#         print(json.dumps(result, indent=2, ensure_ascii=False))
-#         
-#     asyncio.run(test())
+    async def _run_arbiter(self, agent_results: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        4th agent that reads all other agents' outputs and checks for
+        contradictions, assigns overall confidence, and produces a synthesis.
+        """
+        arbiter = ASMRAgent(
+            name="ArbiterAgent",
+            system_prompt=(
+                "You are the Arbiter Agent. You receive the outputs of multiple specialist agents "
+                "who analyzed the same source data independently. Your job:\n"
+                "1. Detect contradictions between agents (e.g., Agent A says X, Agent B implies not-X)\n"
+                "2. Flag any agent output that looks like hallucination (claims not grounded in source)\n"
+                "3. Produce a unified confidence score (high/medium/low) for the overall analysis\n"
+                "4. Write a brief synthesis combining the strongest, non-contradictory findings\n"
+                "Be strict. If agents agree, confidence is high. If they contradict, flag it."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "contradictions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent_a": {"type": "string"},
+                                "claim_a": {"type": "string"},
+                                "agent_b": {"type": "string"},
+                                "claim_b": {"type": "string"},
+                                "severity": {"type": "string", "enum": ["critical", "minor"]},
+                            },
+                        },
+                    },
+                    "hallucination_flags": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent": {"type": "string"},
+                                "suspicious_claim": {"type": "string"},
+                                "reason": {"type": "string"},
+                            },
+                        },
+                    },
+                    "overall_confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "synthesis": {
+                        "type": "string",
+                        "description": "Brief unified summary of the strongest findings",
+                    },
+                },
+            },
+        )
+
+        # Serialize agent results as the arbiter's input
+        arbiter_input = json.dumps(agent_results, indent=2, ensure_ascii=False)
+        result = await self._run_agent(arbiter, arbiter_input)
+        return result

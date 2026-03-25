@@ -1,3 +1,4 @@
+import json
 import httpx
 import logging
 
@@ -6,55 +7,124 @@ logger = logging.getLogger(__name__)
 API_URL = "http://localhost:5050"
 DEFAULT_AGENT_ID = "Luca_ASMR"
 
+
+class Port5050Error(Exception):
+    """Port 5050 communication failure."""
+    pass
+
+
 class Port5050Bridge:
     """
-    기존의 RAG 기반 단순 검색을 수행하던 Port 5050 공유 장기 메모리 서버와 통신하는 비동기 브릿지입니다.
-    이 브릿지를 통해 ASMR 오케스트레이터가 대규모 지식망(Graph DB)나 Vector DB에서 원시 컨텍스트를 퍼올립니다.
+    Port 5050 shared long-term memory server bridge with connection pooling.
+    Reuses a single httpx.AsyncClient across all requests to avoid
+    repeated TCP handshake overhead.
     """
+
     def __init__(self, api_url: str = API_URL):
         self.api_url = api_url
-        
+        self._client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=self.api_url,
+                timeout=httpx.Timeout(60.0, connect=5.0),
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            )
+        return self._client
+
+    async def close(self):
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
+
+    async def health_check(self) -> bool:
+        """Verify that Port 5050 server is reachable before running analysis."""
+        client = await self._get_client()
+
+        # Try /health first (fast path)
+        try:
+            resp = await client.get("/health", timeout=5.0)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+
+        # Fallback: /query with minimal payload (5050 may lack /health endpoint)
+        try:
+            resp = await client.post(
+                "/query",
+                json={"question": "ping", "agent_id": "healthcheck"},
+                timeout=20.0,
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     async def fetch_raw_memory(self, question: str, agent_id: str = DEFAULT_AGENT_ID) -> str:
         """
-        Port 5050 /query 엔드포인트를 호출하여 질문과 관련된 초기 장기 기억 덩어리를 가져옵니다.
-        (기존 RAG 방식의 1차 검색)
-        가져온 텍스트는 이후 ASMR 에이전트들의 병렬 분석(Fact/Context/Timeline)의 Context Data가 됩니다.
+        Fetch initial long-term memory context from Port 5050 /query.
+        Raises Port5050Error on failure instead of silently returning empty string.
         """
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{self.api_url}/query",
-                    json={"question": question, "agent_id": agent_id},
-                    timeout=10.0
+        client = await self._get_client()
+        try:
+            response = await client.post(
+                "/query",
+                json={"question": question, "agent_id": agent_id},
+            )
+            if response.status_code == 200:
+                data = response.json()
+                result = data.get("result", "")
+                if not result or not result.strip():
+                    raise Port5050Error(
+                        f"Port 5050 returned empty result for question: '{question[:80]}...'"
+                    )
+                return result
+            else:
+                raise Port5050Error(
+                    f"Port 5050 HTTP {response.status_code}: {response.text[:200]}"
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    return data.get("result", "")
-                else:
-                    logger.error(f"Failed to fetch memory from 5050: {response.text}")
-                    return f"Error fetching from 5050: {response.text}"
-            except Exception as e:
-                logger.error(f"Connection error to Port 5050: {e}")
-                return ""
+        except Port5050Error:
+            raise
+        except httpx.ConnectError:
+            raise Port5050Error(
+                "Cannot connect to Port 5050. Is the memory server running? "
+                "(python shared_memory_server.py or equivalent)"
+            )
+        except httpx.TimeoutException:
+            raise Port5050Error("Port 5050 request timed out (>10s)")
+        except Exception as e:
+            raise Port5050Error(f"Unexpected error communicating with Port 5050: {e}")
 
-    async def ingest_memory(self, content: str, title: str = "ASMR Insight", agent_id: str = DEFAULT_AGENT_ID) -> bool:
+    async def ingest_memory(
+        self,
+        content: str,
+        title: str = "ASMR Insight",
+        agent_id: str = DEFAULT_AGENT_ID,
+    ) -> bool:
         """
-        Port 5050 /ingest 엔드포인트를 호출하여, ASMR 요원들이 병렬로 정리해낸 고순도의 결론을
-        다시 장기 메모리에 정식으로 영구 저장합니다.
+        Ingest high-purity ASMR analysis results back into long-term memory.
+        Returns True on success, raises Port5050Error on failure.
         """
-        text = f"주제: {title}\n내용: {content}"
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{self.api_url}/ingest",
-                    json={"text": text, "agent_id": agent_id},
-                    timeout=10.0
+        text = f"[{title}]\n{content}"
+        client = await self._get_client()
+        try:
+            response = await client.post(
+                "/ingest",
+                json={"text": text, "agent_id": agent_id},
+            )
+            if response.status_code == 200:
+                logger.info(f"Ingested to 5050: '{title}' ({len(content)} chars)")
+                return True
+            else:
+                raise Port5050Error(
+                    f"Ingest failed HTTP {response.status_code}: {response.text[:200]}"
                 )
-                if response.status_code == 200:
-                    return True
-                else:
-                    logger.error(f"Failed to ingest memory to 5050: {response.text}")
-                    return False
-            except Exception as e:
-                logger.error(f"Connection error to Port 5050: {e}")
-                return False
+        except Port5050Error:
+            raise
+        except httpx.ConnectError:
+            raise Port5050Error("Cannot connect to Port 5050 for ingest")
+        except httpx.TimeoutException:
+            raise Port5050Error("Port 5050 ingest timed out")
+        except Exception as e:
+            raise Port5050Error(f"Unexpected ingest error: {e}")

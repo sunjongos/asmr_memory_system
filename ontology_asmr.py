@@ -1,20 +1,25 @@
-from typing import List, Dict, Any
+import logging
+
 from .core import ASMRAgent, ASMRParallelOrchestrator
+from .port_5050_bridge import Port5050Bridge, Port5050Error
+
+logger = logging.getLogger(__name__)
+
 
 def get_ontology_traversal_agents() -> list[ASMRAgent]:
     """
-    [Phase 3] 온톨로지(지식 그래프)를 순회(Traversal)하며 정보를 탐색하는 에이전트.
-    초거대 그래프를 다 넘기기엔 토큰 낭비가 심하므로, 특정 Sub-Graph(노드+엣지 모음)를 
-    텍스트화하여 컨텍스트로 주입받고, 이를 해석합니다.
+    [Phase 3] Knowledge graph traversal agents.
+    Analyze text-serialized sub-graphs to interpret edges and suggest next hops.
     """
-    
-    # 1. 엣지 해석기(Edge Interpreter)
+
     edge_agent = ASMRAgent(
         name="EdgeInterpreterAgent",
         system_prompt=(
-            "너는 지식그래프(Ontology)의 엣지(관계)를 전담하여 해석하는 에이전트야. "
-            "현재 노드와 주변 노드들이 어떤 관계(Is-A, Has-A, Treated-By 등)로 엮여 있는지 분석하고, "
-            "이 관계망이 사용자의 질문(또는 진단)에 어떤 핵심 힌트를 주는지 도출해."
+            "You are the Edge Interpreter Agent for knowledge graphs (ontologies). "
+            "Analyze the relationships (Is-A, Has-A, Treated-By, Causes, etc.) between "
+            "nodes in the given sub-graph. Explain what hints these relationships provide "
+            "for the user's question or diagnosis. "
+            "Return an empty inferred_relationships array if no meaningful relationships found."
         ),
         json_schema={
             "type": "object",
@@ -27,51 +32,68 @@ def get_ontology_traversal_agents() -> list[ASMRAgent]:
                             "node_A": {"type": "string"},
                             "relationship": {"type": "string"},
                             "node_B": {"type": "string"},
-                            "insight": {"type": "string", "description": "해당 관계가 주는 의미"}
-                        }
-                    }
+                            "insight": {"type": "string"},
+                        },
+                    },
                 }
-            }
-        }
+            },
+        },
     )
-    
-    # 2. 경로 탐색 제안자(Pathfinder)
+
     pathfinder_agent = ASMRAgent(
         name="PathfinderAgent",
         system_prompt=(
-            "너는 지식그래프 망에서 다음에 어디로 이동해야 할지(Hop) 경로를 제안하는 에이전트야. "
-            "현재까지 주어진 정보가 불충분할 경우, 추가 질문이나 연관 노드로의 확장을 제안해."
+            "You are the Pathfinder Agent for knowledge graph navigation. "
+            "Given the current sub-graph context, suggest which nodes to explore next (hop to). "
+            "If information is insufficient, propose follow-up queries or related node expansions. "
+            "Return an empty suggested_next_hops array if current information is sufficient."
         ),
         json_schema={
             "type": "object",
             "properties": {
                 "suggested_next_hops": {
                     "type": "array",
-                    "items": {
-                        "type": "string",
-                        "description": "다음에 조회해야 할 노드의 이름이나 카테고리"
-                    }
+                    "items": {"type": "string"},
                 },
                 "reason": {
                     "type": "string",
-                    "description": "왜 그 노드로 탐색을 확장해야 하는가?"
-                }
-            }
-        }
+                    "description": "Why expand to those nodes?",
+                },
+            },
+        },
     )
-    
+
     return [edge_agent, pathfinder_agent]
+
 
 class OntologyASMRSearcher:
     """
-    Dr.Claw 시스템 내의 온톨로지 지식망이나 NDB(Namyangju Baek Hospital) 지식망에
-    ASMR 병렬 추론을 붙이는 래퍼 로직입니다.
+    Attach ASMR parallel reasoning to ontology knowledge graphs
+    (Dr.Claw, NDB, or any domain graph).
     """
-    def __init__(self, orchestrator: ASMRParallelOrchestrator):
+
+    def __init__(self, orchestrator: ASMRParallelOrchestrator, bridge: Port5050Bridge = None):
         self.orchestrator = orchestrator
+        self.bridge = bridge if bridge else Port5050Bridge()
         self.agents = get_ontology_traversal_agents()
-        
+
     async def traverse_subgraph(self, subgraph_json: str):
-        """특정 서브그래프 데이터(JSON 또는 Markdown 포맷)를 읽고 추론합니다."""
-        results = await self.orchestrator.run_parallel_analysis(self.agents, subgraph_json)
-        return results
+        """Read and reason over a specific sub-graph (JSON or Markdown format)."""
+        return await self.orchestrator.run_parallel_analysis(self.agents, subgraph_json)
+
+    async def traverse_from_5050_memory(self, question: str):
+        """
+        Fetch ontology-relevant context from Port 5050, then run
+        Edge Interpreter + Pathfinder in parallel.
+        """
+        logger.info(f"Fetching ontology context from Port 5050 for: {question}")
+
+        raw_context = await self.bridge.fetch_raw_memory(
+            question, agent_id="Ontology_ASMR"
+        )
+
+        logger.info(
+            f"Received {len(raw_context)} chars. "
+            f"Dispatching {len(self.agents)} ontology agents + Arbiter..."
+        )
+        return await self.orchestrator.run_parallel_analysis(self.agents, raw_context)
