@@ -10,20 +10,49 @@ from .luca_observer import LucaMemoryObserver
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-# 더미 LLM 호출기 (실제 프로덕션에서는 OpenAI, Anthropic, Gemini API 통신 코드를 여기에 붙입니다)
-async def dummy_llm_call(system_prompt: str, user_prompt: str, json_schema: dict) -> str:
-    """Claude Code나 실제 환경 파이프라인에서 돌아갈 때 LLM을 호출하는 로직입니다."""
-    # 현재는 CLI 시연을 위해 더미 JSON을 반환합니다.
-    dummy_result = {
-        "status": "mocked",
-        "fact_or_context": f"Simulated insights for prompt length {len(user_prompt)}"
+import httpx
+import os
+
+async def gemini_llm_call(system_prompt: str, user_prompt: str, json_schema: dict) -> str:
+    """GEMINI_API_KEY 환경변수를 사용하여 실제 Gemini 2.5 Flash API를 호출합니다."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return json.dumps({"error": "GEMINI_API_KEY 환경변수가 설정되어 있지 않습니다."})
+        
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    
+    # 시스템 프롬프트에 엄격한 JSON 반환 지시 추가
+    schema_str = json.dumps(json_schema, ensure_ascii=False) if json_schema else "{}"
+    full_system_prompt = system_prompt + f"\n\n[중요 지시사항]\n반드시 아래 JSON 스키마 규격에 맞춰 순수한 JSON 문자열만 반환해야 합니다. 마크다운 기호(```json 등)는 포함하지 마세요.\n스키마: {schema_str}"
+    
+    payload = {
+        "systemInstruction": {"parts": [{"text": full_system_prompt}]},
+        "contents": [{"parts": [{"text": user_prompt}]}],
+        "generationConfig": {"temperature": 0.2}
     }
-    await asyncio.sleep(0.5)
-    return json.dumps(dummy_result)
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=payload, timeout=30.0)
+        if resp.status_code != 200:
+            return json.dumps({"error": f"Gemini API Error: {resp.text}"})
+            
+        data = resp.json()
+        try:
+            text_response = data['candidates'][0]['content']['parts'][0]['text']
+            
+            # 마크다운 방어 로직 (```json ... ``` 제거)
+            text_response = text_response.strip()
+            if text_response.startswith('```json'): text_response = text_response[7:]
+            if text_response.startswith('```'): text_response = text_response[3:]
+            if text_response.endswith('```'): text_response = text_response[:-3]
+                
+            return text_response.strip()
+        except KeyError:
+            return json.dumps({"error": "Failed to parse API response"})
 
 async def run_query(question: str):
     print(f"🧠 [ASMR CLI] 질의를 5050 Port 공유 메모리로 전송합니다: '{question}'")
-    core_engine = ASMRParallelOrchestrator(llm_async_callable=dummy_llm_call)
+    core_engine = ASMRParallelOrchestrator(llm_async_callable=gemini_llm_call)
     dr_claw = DrClawSearchOrchestrator(orchestrator=core_engine)
     
     result = await dr_claw.analyze_from_5050_memory(question)
@@ -33,7 +62,7 @@ async def run_query(question: str):
 
 async def run_observe(log_text: str):
     print(f"🕵️ [ASMR CLI] 백그라운드 Observer가 세션 로그를 분석하고 5050 포트에 저장합니다...")
-    core_engine = ASMRParallelOrchestrator(llm_async_callable=dummy_llm_call)
+    core_engine = ASMRParallelOrchestrator(llm_async_callable=gemini_llm_call)
     observer = LucaMemoryObserver(orchestrator=core_engine)
     
     result = await observer.process_session_log(log_text)
